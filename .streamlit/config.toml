@@ -1,0 +1,13 @@
+# Streamlit Cloud는 이 파일을 자동으로 읽는다.
+# 로컬에서도 streamlit run 시 같이 적용됨.
+
+[server]
+# Cloud에선 자동으로 0.0.0.0 + 외부 포트가 잡힘. 아래는 로컬 호환용.
+headless = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#5b8def"
