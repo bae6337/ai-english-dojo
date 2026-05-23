@@ -1322,7 +1322,11 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               if (!aiSpeaking && !aiSpeakingWatchdog) return; // 이미 정리됨
               aiSpeaking = false;
               if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
-              currentAiItemId = null;  // 이번 응답이 끝났으니 추적 종료
+              // ★ currentAiItemId 는 여기서 지우지 않는다.
+              //   OpenAI 는 audio 를 realtime 보다 훨씬 빠르게 만들어 보낸다 →
+              //   response.done 이 떠도 브라우저 버퍼엔 수십초 분량 audio 가 남아있음.
+              //   그 시간 동안 사용자가 인터럽트해도 truncate 가능해야 함.
+              //   다음 AI 응답 아이템이 시작될 때 (response.output_item.added) 새 id 로 교체됨.
               if (window.updateStatus) window.updateStatus({ aiSpeak: false });
               console.log(`%c[AI DONE] aiSpeaking=false (reason: ${reason})`, "color: #20c997; font-weight: bold");
 
@@ -1591,26 +1595,35 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               "background:#ff6b00;color:white;font-weight:bold");
 
           // (a) 서버 정리: cancel + clear + truncate (모두 항상 전송, 없으면 서버가 무시)
-          //   ★ truncate 가 핵심: OpenAI 는 audio 를 realtime 보다 빠르게 만들어 한 번에 보낸다.
+          //   ★ truncate 가 핵심: OpenAI 는 audio 를 realtime 보다 훨씬 빠르게 만들어 한꺼번에 보낸다.
           //   response.done 이 떠도 브라우저 디코더에는 수십 초 분량 audio 가 남아있고,
           //   서버 대화 컨텍스트에도 그 답변이 통째로 기록되어 있다.
-          //   audio_end_ms=0 으로 truncate 하면 서버가 그 답변을 "사용자가 0ms 만 들었음" 으로 간주해
-          //   컨텍스트에서 잘라낸다 → 새 응답이 깨끗하게 새로운 사용자 발화에만 반응함.
+          //   truncate 로 "사용자가 N ms 까지만 들었다" 고 알려주면 그 뒤를 컨텍스트에서 잘라낸다.
+          //   → 새 응답이 잘려나간 부분을 참조하지 못함 → 사용자의 새 발화에만 반응.
           if (dc && dc.readyState === 'open') {
               try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
               try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
               if (currentAiItemId) {
+                  // audio_end_ms 추정: 0 으로 보내면 일부 케이스에서 서버가 거부할 수 있어
+                  // 1ms 같은 최소값을 사용. "사용자는 거의 0 에 가까운 만큼 들었다" 의미는 동일.
+                  // (실제 들은 시간을 추적하면 더 정확하지만, 의미상으론 0 에 가까워야 컨텍스트가 깨끗해짐.)
+                  const truncMs = 1;
                   try {
                       dc.send(JSON.stringify({
                           type: "conversation.item.truncate",
                           item_id: currentAiItemId,
                           content_index: 0,
-                          audio_end_ms: 0,
+                          audio_end_ms: truncMs,
                       }));
-                      console.log(`%c[INTERRUPT] truncate sent for item ${currentAiItemId} (audio_end_ms=0)`,
+                      console.log(`%c[INTERRUPT] truncate sent for item ${currentAiItemId} (audio_end_ms=${truncMs})`,
                           "color:#ff6b00;font-weight:bold");
                   } catch(_) {}
+                  // truncate 를 한 번 보낸 후엔 이 id 를 비워서 같은 응답에 중복 truncate 안 가게.
+                  // 새 AI 응답이 시작되면 response.output_item.added 에서 새 id 로 교체됨.
                   currentAiItemId = null;
+              } else {
+                  console.log("%c[INTERRUPT] no currentAiItemId — skipping truncate",
+                      "color:#6c757d;font-style:italic");
               }
           }
 
