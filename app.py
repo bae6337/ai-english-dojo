@@ -1396,6 +1396,23 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   lastAudioDeltaTs = Date.now();
                   armAiWatchdog();
                   if (window.updateStatus) window.updateStatus({ aiSpeak: true });
+
+                  // ★ 직전 인터럽트로 수신 audio 트랙이 disabled 였다면 여기서 복구.
+                  //   복구하지 않으면 새 AI 응답이 들리지 않음.
+                  try {
+                      if (pc && pc.getReceivers) {
+                          pc.getReceivers().forEach(r => {
+                              if (r && r.track && r.track.kind === 'audio') {
+                                  r.track.enabled = true;
+                              }
+                          });
+                      }
+                  } catch(_) {}
+                  const remoteAudio = document.getElementById('remoteAudio');
+                  if (remoteAudio) {
+                      try { remoteAudio.muted = false; } catch(_) {}
+                  }
+
                   console.log("%c[AI] Speaking started (response.created)", "color: #20c997; font-weight: bold");
               }
 
@@ -1531,27 +1548,65 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
       try {
           // 1) AI 발화 중이면 가로채서 종료
           if (aiSpeaking) {
-              console.log("%c[INTERRUPT] User pressed Talk while AI speaking — canceling AI response",
+              console.log("%c[INTERRUPT] User pressed Talk while AI speaking — hard cutting AI",
                   "background:#ff6b00;color:white;font-weight:bold");
+
+              // (a) 서버에 응답 취소 요청 — 더 이상 새 오디오/텍스트를 보내지 마라
               if (dc && dc.readyState === 'open') {
                   try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
+                  // 동시에 입력 버퍼도 비워서 AI 에코가 새 발화로 잘못 인식되지 않게.
+                  try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
               }
-              // 진행 중인 AI 음성 출력 일시 음소거 (새 응답 시작 시 자연스럽게 풀림)
+
+              // (b) ★ 브라우저 측 디코더 큐의 잔여 오디오까지 즉시 무음으로.
+              //   remoteAudio.muted 만으로는 디코더에 쌓인 프레임이 계속 흘러나옴.
+              //   WebRTC 수신 트랙 자체를 enabled=false 로 만들면 트랙이 silence 를 출력.
+              //   다음 response.created 이벤트에서 다시 enabled=true 로 복구.
+              try {
+                  if (pc && pc.getReceivers) {
+                      pc.getReceivers().forEach(r => {
+                          if (r && r.track && r.track.kind === 'audio') {
+                              r.track.enabled = false;
+                          }
+                      });
+                  }
+              } catch (rcvErr) {
+                  console.warn("[INTERRUPT] receiver disable failed:", rcvErr);
+              }
+
+              // (c) 오디오 요소도 같이 음소거 + 재생 위치 끝으로 점프해 잔여 버퍼 버리기
               const remoteAudio = document.getElementById('remoteAudio');
               if (remoteAudio) {
-                  try { remoteAudio.muted = true; } catch(_) {}
+                  try {
+                      remoteAudio.muted = true;
+                      // currentTime 점프는 일부 브라우저에서 무시될 수 있으나, 가능하면 최신으로.
+                      if (Number.isFinite(remoteAudio.duration) && remoteAudio.duration > 0) {
+                          remoteAudio.currentTime = remoteAudio.duration;
+                      }
+                  } catch(_) {}
               }
-              // 미사일 타이머/플래그 청소 (혹시 진행 중이었다면)
+
+              // (d) 미사일 타이머/플래그 청소 (혹시 진행 중이었다면)
               if (missileWaitTimer)   { clearTimeout(missileWaitTimer);   missileWaitTimer = null; }
               if (missileFlightTimer) { clearTimeout(missileFlightTimer); missileFlightTimer = null; }
               isMissileActive = false;
               if (window.updateStatus) window.updateStatus({ firing: false, hit: false });
-              // aiSpeaking 강제 해제 (실제 response.cancelled 이벤트도 곧 도착함)
+
+              // (e) aiSpeaking 강제 해제 (실제 response.cancelled 이벤트도 곧 도착함)
               aiSpeaking = false;
               if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
               if (window.updateStatus) window.updateStatus({ aiSpeak: false });
           } else {
-              // 음소거 풀기 (이전에 일시정지/인터럽트로 mute 였을 수 있음)
+              // AI 가 말 중이 아니더라도, 이전 인터럽트로 트랙이 disabled 였을 가능성 → 복구
+              try {
+                  if (pc && pc.getReceivers) {
+                      pc.getReceivers().forEach(r => {
+                          if (r && r.track && r.track.kind === 'audio') {
+                              r.track.enabled = true;
+                          }
+                      });
+                  }
+              } catch(_) {}
               const remoteAudio = document.getElementById('remoteAudio');
               if (remoteAudio) {
                   try { remoteAudio.muted = false; } catch(_) {}
