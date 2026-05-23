@@ -1397,8 +1397,20 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   armAiWatchdog();
                   if (window.updateStatus) window.updateStatus({ aiSpeak: true });
 
-                  // ★ 직전 인터럽트로 수신 audio 트랙이 disabled 였다면 여기서 복구.
+                  // ★ 직전 인터럽트로 audio element / 트랙이 끊어졌다면 여기서 복구.
                   //   복구하지 않으면 새 AI 응답이 들리지 않음.
+                  const remoteAudio = document.getElementById('remoteAudio');
+                  if (remoteAudio) {
+                      try {
+                          // srcObject 복구 (인터럽트 때 null 로 만들어 두었음)
+                          if (!remoteAudio.srcObject && window.__savedAudioStream) {
+                              remoteAudio.srcObject = window.__savedAudioStream;
+                          }
+                          remoteAudio.muted = false;
+                          remoteAudio.play().catch(() => {});
+                      } catch(_) {}
+                  }
+                  // 수신 audio 트랙 enable (인터럽트 때 disable 했었음)
                   try {
                       if (pc && pc.getReceivers) {
                           pc.getReceivers().forEach(r => {
@@ -1408,10 +1420,6 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                           });
                       }
                   } catch(_) {}
-                  const remoteAudio = document.getElementById('remoteAudio');
-                  if (remoteAudio) {
-                      try { remoteAudio.muted = false; } catch(_) {}
-                  }
 
                   console.log("%c[AI] Speaking started (response.created)", "color: #20c997; font-weight: bold");
               }
@@ -1585,33 +1593,22 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               console.warn("[INTERRUPT] receiver disable failed:", rcvErr);
           }
 
-          // (c) 오디오 요소도 mute + srcObject 재설정으로 큐 비우기
+          // (c) 오디오 요소 mute + srcObject 끊기 → 디코더 큐에 쌓인 잔여 오디오가 새어나오지 못하게.
+          //   ★ 다음 response.created 에서 복구한다 — 여기서 절대 setTimeout 으로 다시 붙이지 말 것.
+          //     이전 버그: 50ms 후 srcObject 다시 붙이고 트랙도 enable → 그 사이 OpenAI 서버가 cancel
+          //     처리 전에 보낸 인플라이트 오디오 + 디코더 큐의 잔여 오디오가 그대로 흘러나옴.
+          //   사용자가 말하는 동안 audio element 는 srcObject=null + tracks disabled 상태로 침묵 유지.
+          //   사용자 발화 종료 → 미사일 → 새 response.create → response.created 이벤트 → 거기서 복구.
           const remoteAudio = document.getElementById('remoteAudio');
           if (remoteAudio) {
               try {
-                  remoteAudio.muted = true;
-                  // srcObject 잠시 끊었다가 다시 연결 → 디코더 큐 초기화 효과
-                  const stream = remoteAudio.srcObject;
-                  if (stream) {
-                      remoteAudio.srcObject = null;
-                      // 다음 tick 에서 다시 붙임. response.created 에서 어차피 복구되지만
-                      // 즉시 청취 가능 상태로 만들어 둠.
-                      setTimeout(() => {
-                          try {
-                              remoteAudio.srcObject = stream;
-                              remoteAudio.muted = false;
-                              // 트랙도 같이 다시 enable (사용자가 말 마치면 새 AI 응답이 와야 하니까)
-                              if (pc && pc.getReceivers) {
-                                  pc.getReceivers().forEach(r => {
-                                      if (r && r.track && r.track.kind === 'audio') {
-                                          r.track.enabled = true;
-                                      }
-                                  });
-                              }
-                              remoteAudio.play().catch(() => {});
-                          } catch(_) {}
-                      }, 50);
+                  // 다음에 복구할 수 있도록 stream 참조 저장
+                  if (remoteAudio.srcObject) {
+                      window.__savedAudioStream = remoteAudio.srcObject;
                   }
+                  remoteAudio.muted = true;
+                  try { remoteAudio.pause(); } catch(_) {}
+                  remoteAudio.srcObject = null;
               } catch(_) {}
           }
 
