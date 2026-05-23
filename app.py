@@ -991,11 +991,16 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   let aiSpeaking = false;        // AI 발화 구간 플래그
   let lastAudioDeltaTs = 0;      // 마지막 response.audio.delta 도착 시각 (ms) - watchdog용
   let aiSpeakingWatchdog = null; // aiSpeaking 안전 해제 타이머
-  // ★ 현재 AI 가 만들고 있는 conversation item id. 인터럽트 시 truncate+delete 로 서버 컨텍스트를 정리.
+  // ★ 현재 AI 가 만들고 있는 conversation item id. truncate (audio 자르기) 에만 사용.
   let currentAiItemId = null;
-  // ★ 직전 사용자 발화 item id. 인터럽트 시 함께 delete 하여 서버 컨텍스트를 깨끗하게.
-  //   (truncate+delete 가 AI 응답만 지우면 사용자 직전 질문이 남아 새 응답에 영향)
+  // ★ 직전 사용자 발화 item id. 디버깅/표시 용도.
   let lastUserItemId = null;
+  // ★ 세션 시작 이후 누적된 모든 conversation item id (user + AI).
+  //   인터럽트 시 이 배열의 모든 item 을 delete 해서 컨텍스트를 완전히 비운다.
+  //   (이전 버그: 직전 턴 만 지우면 더 앞 턴의 사용자 질문 + AI 응답이 컨텍스트에 남아
+  //    새 응답이 이전 주제 분위기를 끌고 옴. 예: Czech 주제로 한참 이야기하다 다른 주제로 바꿔도
+  //    AI 가 계속 Czech 관련으로 끌고 가는 현상.)
+  let allItemIds = [];
   const AI_SPEAKING_SILENCE_MS = 5000; // 5초간 오디오 델타 없으면 응답 끝난 것으로 간주
   
   // [IMPORTANT] VAD State for Manual Detection
@@ -1397,10 +1402,12 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   const itemId = ev.item_id || ev.conversation_item_id || (ev.item && ev.item.id);
                   console.log(`%c[STT] User said: "${text}"`, 'color: #fd7e14; font-weight: bold; background: #fff3cd; padding: 2px');
                   if (window.updateTranscript) window.updateTranscript({ user: text });
-                  // ★ 사용자 직전 발화 id 추적. 다음 인터럽트 때 같이 delete 하여 컨텍스트 정리.
+                  // ★ 사용자 발화 id 추적. 인터럽트 시 컨텍스트에서 같이 delete.
                   if (itemId) {
                       lastUserItemId = itemId;
-                      console.log(`%c[STT] lastUserItemId updated: ${itemId}`, "color:#fd7e14;font-size:10px");
+                      if (!allItemIds.includes(itemId)) allItemIds.push(itemId);
+                      console.log(`%c[STT] item tracked: ${itemId} (total ${allItemIds.length})`,
+                          "color:#fd7e14;font-size:10px");
                   }
                   // ★ 미사일 모드에서는 pendingUserItems 에 추가하지 않는다.
                   //   미사일 모드는 turn_detection=null 이라 서버 VAD 가 OFF → 에코로 인한 가짜 STT 가 생길 일이 없음.
@@ -1475,10 +1482,12 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                       "color: #20c997; font-weight: bold");
               }
 
-              // === 4.5. AI conversation item id 캡처 (인터럽트 시 truncate 용) ===
+              // === 4.5. AI conversation item id 캡처 (인터럽트 시 truncate / 전체 컨텍스트 삭제 용) ===
               if (ev.type === 'response.output_item.added' && ev.item && ev.item.id) {
                   currentAiItemId = ev.item.id;
-                  console.log(`%c[AI] item_id captured: ${currentAiItemId}`, "color: #6f42c1; font-size: 10px");
+                  if (!allItemIds.includes(currentAiItemId)) allItemIds.push(currentAiItemId);
+                  console.log(`%c[AI] item tracked: ${currentAiItemId} (total ${allItemIds.length})`,
+                      "color: #6f42c1; font-size: 10px");
               }
 
               // === 5. AI 활동 신호 도착 시 watchdog 갱신 ===
@@ -1638,47 +1647,44 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
               try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
 
-              // ★ 1) AI 응답 아이템 truncate + delete
+              // ★ 1) 현재 AI 응답 truncate (audio_end_ms=1 로 잘라 audio 부분 정리)
               if (currentAiItemId) {
-                  const truncMs = 1;
                   try {
                       dc.send(JSON.stringify({
                           type: "conversation.item.truncate",
                           item_id: currentAiItemId,
                           content_index: 0,
-                          audio_end_ms: truncMs,
+                          audio_end_ms: 1,
                       }));
                   } catch(_) {}
-                  try {
-                      dc.send(JSON.stringify({
-                          type: "conversation.item.delete",
-                          item_id: currentAiItemId,
-                      }));
-                      console.log(`%c[INTERRUPT] AI item truncate+delete: ${currentAiItemId}`,
-                          "color:#ff6b00;font-weight:bold");
-                  } catch(_) {}
-                  currentAiItemId = null;
-              } else {
-                  console.log("%c[INTERRUPT] no currentAiItemId",
-                      "color:#6c757d;font-style:italic");
               }
 
-              // ★ 2) 사용자 직전 발화 아이템도 함께 delete
-              //   서버 컨텍스트가 [지움]-[지움]-[새 사용자 발화] 가 되도록 해서, AI 새 응답이
-              //   완전히 새로운 사용자 입력에만 기반하도록 함. 이전 질문이 컨텍스트에 남아있으면
-              //   AI 가 "사용자가 이전에 Czech, Prague Spring 묻고 이제 날씨 묻네"라는 흐름을
-              //   잡아내서 답변이 오염될 수 있음.
-              if (lastUserItemId) {
+              // ★ 2) 세션 시작 이후 누적된 ALL conversation item 을 모두 delete.
+              //   기존 방식 (직전 아이템만 지우기) 으론 더 앞 턴 아이템들이 컨텍스트에 남아
+              //   새 응답이 이전 주제 분위기를 끌고 옴. (예: Czech 주제로 대화 → 다른 주제로 바꿔도
+              //   AI 가 계속 Czech 관련 응답 — 이전 Turn 의 사용자 질문 + AI 응답이 컨텍스트에
+              //   남아있어 AI 가 그 흐름을 잡아내기 때문.)
+              //   ALL 삭제 = 서버 컨텍스트를 매 인터럽트마다 깨끗하게 리셋.
+              let deletedCount = 0;
+              for (const id of allItemIds) {
                   try {
                       dc.send(JSON.stringify({
                           type: "conversation.item.delete",
-                          item_id: lastUserItemId,
+                          item_id: id,
                       }));
-                      console.log(`%c[INTERRUPT] User item delete: ${lastUserItemId}`,
-                          "color:#ff6b00;font-weight:bold");
+                      deletedCount++;
                   } catch(_) {}
-                  lastUserItemId = null;
               }
+              if (deletedCount > 0) {
+                  console.log(`%c[INTERRUPT] deleted ${deletedCount} conversation items (full context wipe)`,
+                      "color:#ff6b00;font-weight:bold");
+              } else {
+                  console.log("%c[INTERRUPT] no items to delete (fresh session)",
+                      "color:#6c757d;font-style:italic");
+              }
+              allItemIds = [];
+              currentAiItemId = null;
+              lastUserItemId = null;
           }
 
           // (b) ★ 브라우저 측 디코더 큐의 잔여 오디오까지 즉시 무음으로.
