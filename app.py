@@ -914,21 +914,41 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
         padding: 15px;
         margin: 15px 0;
         box-shadow: 0 4px 12px rgba(0,123,255,0.1);
+        max-height: 320px;
+        overflow-y: auto;
+        scroll-behavior: smooth;
     }
+    .transcript-empty { text-align:center; color:#adb5bd; font-style:italic; padding:20px 0; }
     .t-row {
-        margin-bottom: 8px;
-        font-size: 16px;
-        line-height: 1.4;
+        margin-bottom: 10px;
+        font-size: 15px;
+        line-height: 1.45;
+        padding: 8px 10px;
+        border-radius: 8px;
+        background: #f8f9fa;
+        display: flex;
+        gap: 8px;
+        align-items: flex-start;
     }
+    .t-row.t-user { background: #fff8ec; border-left: 3px solid #fd7e14; }
+    .t-row.t-ai   { background: #eaf4ff; border-left: 3px solid #007bff; }
     .t-label {
         display: inline-block;
-        width: 60px;
+        min-width: 56px;
         font-weight: 800;
         text-transform: uppercase;
+        font-size: 11px;
+        padding-top: 2px;
     }
     .t-user .t-label { color: #fd7e14; }
     .t-ai .t-label { color: #007bff; }
-    .t-content { font-weight: 500; color: #343a40; }
+    .t-content { font-weight: 500; color: #343a40; flex: 1; word-break: break-word; }
+    .t-ts { font-size: 10px; color: #868e96; margin-left: 6px; white-space: nowrap; padding-top: 4px; }
+    .t-clear-btn {
+        font-size: 11px; padding: 4px 10px; background:#e9ecef; color:#495057;
+        border:1px solid #ced4da; border-radius:6px; cursor:pointer; margin-left:auto;
+    }
+    .t-clear-btn:hover { background:#dee2e6; }
     
     .mic-meter { width: 200px; height: 10px; background: #ddd; border-radius: 5px; overflow: hidden; margin: 0 auto 10px; }
     .mic-bar { height: 100%; background: #28a745; width: 0%; transition: width 0.05s; }
@@ -1198,6 +1218,23 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   }
 
   window.connectSystem = async function() {
+      // === Paused 상태이면 그냥 재개 (새 토큰 없이) ===
+      // soft disconnect 로 pc + micStream이 살아있는 경우, 마이크/오디오만 다시 켠다.
+      try {
+          if (pc && pc.connectionState !== 'closed' && pc.connectionState !== 'failed'
+              && micStream && micStream.getAudioTracks().some(t => !t.readyState || t.readyState === 'live')) {
+              micStream.getAudioTracks().forEach(t => t.enabled = true);
+              const remoteAudio = document.getElementById('remoteAudio');
+              if (remoteAudio) remoteAudio.muted = false;
+              if (window.updateStatus) window.updateStatus({ conn: "CONNECTED" });
+              console.log("%c[CONNECT] Resumed from pause (no new token needed)",
+                  "color:#28a745;font-weight:bold");
+              return;
+          }
+      } catch (e) {
+          console.warn("[CONNECT] resume check failed, doing full connect:", e);
+      }
+
       try {
           // [NEW] Audio Debug Timer
           if (window.audioDebugTimer) clearInterval(window.audioDebugTimer);
@@ -1472,10 +1509,30 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
       }
   };
 
+  // Soft pause: PeerConnection을 끊지 않고 마이크/오디오만 끈다.
+  // → Connect 를 다시 누르면 새 토큰 없이 즉시 재개됨 (사이드바 버튼 안 눌러도 됨).
   window.disconnectSystem = () => {
-      if(pc) pc.close();
-      if(micStream) micStream.getTracks().forEach(t => t.stop());
-      if(window.updateStatus) window.updateStatus({conn: "IDLE", micLevel: 0});
+      try {
+          if (micStream) {
+              micStream.getAudioTracks().forEach(t => t.enabled = false);
+          }
+          const remoteAudio = document.getElementById('remoteAudio');
+          if (remoteAudio) remoteAudio.muted = true;
+          if (window.updateStatus) window.updateStatus({ conn: "PAUSED", micLevel: 0 });
+          console.log("%c[PAUSE] Mic muted. PC kept alive. Press Connect to resume.",
+              "color:#fd7e14;font-weight:bold");
+      } catch (e) {
+          console.error("[PAUSE] error:", e);
+      }
+  };
+
+  // 강제 종료: 완전히 끊고 정리. 사이드바의 새 세션 시작 직전에만 의미가 있음.
+  window.hardDisconnectSystem = () => {
+      try { if (pc) pc.close(); } catch(_) {}
+      pc = null;
+      try { if (micStream) micStream.getTracks().forEach(t => t.stop()); } catch(_) {}
+      micStream = null;
+      if (window.updateStatus) window.updateStatus({ conn: "IDLE", micLevel: 0 });
   };
 </script>
 
@@ -1495,16 +1552,26 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   console.log("%c[CLOUD MODE] Session token will be embedded by Streamlit. "
       + "iframe talks directly to api.openai.com.", "color:#17a2b8;font-weight:bold");
 
-  const { useState, useEffect } = React;
+  const { useState, useEffect, useRef } = React;
 
   const App = () => {
     const [status, setStatus] = useState({ conn: "IDLE", userSpk: false, firing: false, hit: false, micLevel: 0 });
-    const [transcript, setTranscript] = useState({ user: "(Waiting...)", ai: "(Waiting...)" });
+    // 대화 기록: [{role: 'user'|'ai', text, ts: Date}]
+    const [messages, setMessages] = useState([]);
     const [errState, setErrState] = useState({ visible: false, stage: "", model: "", message: "", detail: "" });
+    const historyRef = useRef(null);
 
     useEffect(() => {
         window.updateStatus = (s) => setStatus(p => ({ ...p, ...s }));
-        window.updateTranscript = (data) => setTranscript(p => ({ ...p, ...data }));
+        // 기존 호출 형태({user:"..."}, {ai:"..."}) 호환 — 둘 다 append.
+        window.updateTranscript = (data) => {
+            setMessages(prev => {
+                const out = [...prev];
+                if (data && data.user) out.push({ role: 'user', text: data.user, ts: new Date() });
+                if (data && data.ai)   out.push({ role: 'ai',   text: data.ai,   ts: new Date() });
+                return out;
+            });
+        };
         window.updateError = (e) => setErrState(p => ({ ...p, ...e }));
 
         // CSS 변수 업데이트 (비행 시간)
@@ -1514,6 +1581,21 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
         // [DEBUG] 상태 변경 로그
         console.log(`%c[STATUS CHANGE] Conn: ${status.conn}, UserSpk: ${status.userSpk}`, "color: cyan");
     }, [status.conn, status.userSpk]);
+
+    // 새 메시지가 추가될 때마다 바닥으로 스크롤
+    useEffect(() => {
+        if (historyRef.current) {
+            historyRef.current.scrollTop = historyRef.current.scrollHeight;
+        }
+    }, [messages.length]);
+
+    const clearHistory = () => setMessages([]);
+    const fmtTime = (d) => {
+        if (!d) return "";
+        const h = String(d.getHours()).padStart(2, '0');
+        const m = String(d.getMinutes()).padStart(2, '0');
+        return `${h}:${m}`;
+    };
 
     const handleConnect = () => {
         // 새 연결 시 이전 에러는 숨김
@@ -1526,6 +1608,7 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
 
     const statusColor =
         status.conn === 'CONNECTED' ? '#28a745' :
+        status.conn === 'PAUSED'    ? '#fd7e14' :
         status.conn === 'ERROR'     ? '#dc3545' :
         '#6c757d';
 
@@ -1571,20 +1654,37 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
            </div>
         </div>
 
-        {/* === NEW: LIVE TRANSCRIPT LOG === */}
-        <div className="transcript-box">
-            <div style={{textAlign:'center', marginBottom:'10px', color:'#6c757d', fontSize:'12px', fontWeight:'bold', letterSpacing:'1px'}}>📢 LIVE TRANSCRIPT</div>
-            <div className="t-row t-user">
-                <span className="t-label">[YOU]</span>
-                <span className="t-content">{transcript.user}</span>
+        {/* === CONVERSATION HISTORY === */}
+        <div className="transcript-box" ref={historyRef}>
+            <div style={{display:'flex', alignItems:'center', marginBottom:'8px', position:'sticky', top:0, background:'#fff', paddingBottom:'4px', zIndex:1}}>
+                <div style={{flex:1, color:'#6c757d', fontSize:'12px', fontWeight:'bold', letterSpacing:'1px'}}>📢 CONVERSATION HISTORY ({messages.length})</div>
+                {messages.length > 0 && (
+                    <button className="t-clear-btn" onClick={clearHistory}>Clear</button>
+                )}
             </div>
-            <div className="t-row t-ai">
-                <span className="t-label">[AI]</span>
-                <span className="t-content">{transcript.ai}</span>
-            </div>
-            {(status.conn === "CONNECTED" && !status.userSpk) && (
-              <div style={{marginTop:'10px', textAlign:'center', fontSize:'14px', color:'#495057', fontWeight:'700'}}>
-                🎤 지금 말씀해주세요. AI가 듣고 있어요.
+            {messages.length === 0 ? (
+                <div className="transcript-empty">
+                    {status.conn === "CONNECTED"
+                        ? "🎤 지금 말씀해주세요. AI가 듣고 있어요."
+                        : "대화를 시작하면 여기에 기록이 쌓입니다."}
+                </div>
+            ) : (
+                messages.map((m, i) => (
+                    <div key={i} className={`t-row t-${m.role}`}>
+                        <span className="t-label">[{m.role === 'user' ? 'YOU' : 'AI'}]</span>
+                        <span className="t-content">{m.text}</span>
+                        <span className="t-ts">{fmtTime(m.ts)}</span>
+                    </div>
+                ))
+            )}
+            {status.conn === "CONNECTED" && !status.userSpk && messages.length > 0 && (
+              <div style={{marginTop:'8px', textAlign:'center', fontSize:'12px', color:'#28a745', fontStyle:'italic'}}>
+                🎤 듣고 있어요...
+              </div>
+            )}
+            {status.conn === "PAUSED" && (
+              <div style={{marginTop:'8px', textAlign:'center', fontSize:'12px', color:'#fd7e14', fontWeight:'600'}}>
+                ⏸ 일시 정지 — Connect 누르면 즉시 재개
               </div>
             )}
         </div>
@@ -1597,10 +1697,22 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
         </div>
 
         <div className="button-container">
-           <button onClick={handleConnect} disabled={status.conn==='CONNECTED' || status.conn==='CONNECTING...'}>Connect</button>
-           <button onClick={() => window.disconnectSystem()} disabled={status.conn!=='CONNECTED'}>Disconnect</button>
+           <button onClick={handleConnect}
+                   disabled={status.conn==='CONNECTED' || status.conn==='CONNECTING...'}>
+             {status.conn === 'PAUSED' ? '▶ Resume'
+              : status.conn === 'CONNECTED' ? 'Connected'
+              : status.conn === 'CONNECTING...' ? 'Connecting...'
+              : 'Connect'}
+           </button>
+           <button onClick={() => window.disconnectSystem()}
+                   disabled={status.conn!=='CONNECTED'}>
+             ⏸ Pause
+           </button>
            {/* [LOG DOWNLOAD BUTTON] */}
            <button onClick={() => window.downloadLogs()} style={{backgroundColor:'#6f42c1'}}>📥 Save Logs</button>
+        </div>
+        <div style={{textAlign:'center', fontSize:'11px', color:'#6c757d', marginBottom:'6px'}}>
+          Pause는 마이크만 끄고 연결은 유지합니다. Resume 누르면 즉시 재개돼요.
         </div>
         
         <div className="log-box">Ready. Missile Mode: {SETTINGS.is_missile_mode ? "ON" : "OFF"}</div>
