@@ -1394,7 +1394,13 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   const itemId = ev.item_id || ev.conversation_item_id || (ev.item && ev.item.id);
                   console.log(`%c[STT] User said: "${text}"`, 'color: #fd7e14; font-weight: bold; background: #fff3cd; padding: 2px');
                   if (window.updateTranscript) window.updateTranscript({ user: text });
-                  if (itemId && aiSpeaking) {
+                  // ★ 미사일 모드에서는 pendingUserItems 에 추가하지 않는다.
+                  //   미사일 모드는 turn_detection=null 이라 서버 VAD 가 OFF → 에코로 인한 가짜 STT 가 생길 일이 없음.
+                  //   commit 은 HIT 시점에 한 번만 수동 전송. 따라서 STT 가 response.created 이후 (aiSpeaking=true)
+                  //   도착해도 그건 항상 사용자의 진짜 발화. 삭제하면 안 됨.
+                  //   (이전 버그: 모든 사용자 발화가 endAiSpeaking 에서 conversation.item.delete 됨
+                  //    → 서버 컨텍스트가 AI 독백처럼 됨 → 새 응답이 이전 주제 분위기 끌고 옴)
+                  if (itemId && aiSpeaking && !SETTINGS.is_missile_mode) {
                       pendingUserItems.push({ id: itemId, ts: Date.now() });
                       console.log(`%c[STT] (during AI) item_id stored: ${itemId}`, 'color: #ffb347; font-weight: bold');
                   }
@@ -1604,9 +1610,11 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
               try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
               if (currentAiItemId) {
-                  // audio_end_ms 추정: 0 으로 보내면 일부 케이스에서 서버가 거부할 수 있어
-                  // 1ms 같은 최소값을 사용. "사용자는 거의 0 에 가까운 만큼 들었다" 의미는 동일.
-                  // (실제 들은 시간을 추적하면 더 정확하지만, 의미상으론 0 에 가까워야 컨텍스트가 깨끗해짐.)
+                  // ★ truncate + delete 둘 다 보냄.
+                  //   - truncate(audio_end_ms=1): 진행 중인 응답의 audio 를 자름 (response 가 살아있으면 효과 있음)
+                  //   - delete: 그 AI 응답 아이템을 컨텍스트에서 통째로 제거 (텍스트까지) → 새 응답이
+                  //             이전 주제를 끌고 오지 못함. 사용자가 'AI가 이전 내용을 계속 말한다'고
+                  //             느낀 핵심 원인은 truncate 가 텍스트는 안 자르기 때문.
                   const truncMs = 1;
                   try {
                       dc.send(JSON.stringify({
@@ -1615,14 +1623,19 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                           content_index: 0,
                           audio_end_ms: truncMs,
                       }));
-                      console.log(`%c[INTERRUPT] truncate sent for item ${currentAiItemId} (audio_end_ms=${truncMs})`,
+                  } catch(_) {}
+                  try {
+                      dc.send(JSON.stringify({
+                          type: "conversation.item.delete",
+                          item_id: currentAiItemId,
+                      }));
+                      console.log(`%c[INTERRUPT] truncate+delete sent for item ${currentAiItemId}`,
                           "color:#ff6b00;font-weight:bold");
                   } catch(_) {}
-                  // truncate 를 한 번 보낸 후엔 이 id 를 비워서 같은 응답에 중복 truncate 안 가게.
-                  // 새 AI 응답이 시작되면 response.output_item.added 에서 새 id 로 교체됨.
+                  // 한 번 처리한 id 는 비움. 새 AI 응답 시작 시 response.output_item.added 에서 새 id 로 교체됨.
                   currentAiItemId = null;
               } else {
-                  console.log("%c[INTERRUPT] no currentAiItemId — skipping truncate",
+                  console.log("%c[INTERRUPT] no currentAiItemId — skipping truncate/delete",
                       "color:#6c757d;font-style:italic");
               }
           }
