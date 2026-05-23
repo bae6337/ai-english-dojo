@@ -991,8 +991,11 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   let aiSpeaking = false;        // AI 발화 구간 플래그
   let lastAudioDeltaTs = 0;      // 마지막 response.audio.delta 도착 시각 (ms) - watchdog용
   let aiSpeakingWatchdog = null; // aiSpeaking 안전 해제 타이머
-  // ★ 현재 AI 가 만들고 있는 conversation item id. 인터럽트 시 truncate 로 서버 컨텍스트를 정리.
+  // ★ 현재 AI 가 만들고 있는 conversation item id. 인터럽트 시 truncate+delete 로 서버 컨텍스트를 정리.
   let currentAiItemId = null;
+  // ★ 직전 사용자 발화 item id. 인터럽트 시 함께 delete 하여 서버 컨텍스트를 깨끗하게.
+  //   (truncate+delete 가 AI 응답만 지우면 사용자 직전 질문이 남아 새 응답에 영향)
+  let lastUserItemId = null;
   const AI_SPEAKING_SILENCE_MS = 5000; // 5초간 오디오 델타 없으면 응답 끝난 것으로 간주
   
   // [IMPORTANT] VAD State for Manual Detection
@@ -1394,6 +1397,11 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   const itemId = ev.item_id || ev.conversation_item_id || (ev.item && ev.item.id);
                   console.log(`%c[STT] User said: "${text}"`, 'color: #fd7e14; font-weight: bold; background: #fff3cd; padding: 2px');
                   if (window.updateTranscript) window.updateTranscript({ user: text });
+                  // ★ 사용자 직전 발화 id 추적. 다음 인터럽트 때 같이 delete 하여 컨텍스트 정리.
+                  if (itemId) {
+                      lastUserItemId = itemId;
+                      console.log(`%c[STT] lastUserItemId updated: ${itemId}`, "color:#fd7e14;font-size:10px");
+                  }
                   // ★ 미사일 모드에서는 pendingUserItems 에 추가하지 않는다.
                   //   미사일 모드는 turn_detection=null 이라 서버 VAD 가 OFF → 에코로 인한 가짜 STT 가 생길 일이 없음.
                   //   commit 은 HIT 시점에 한 번만 수동 전송. 따라서 STT 가 response.created 이후 (aiSpeaking=true)
@@ -1421,19 +1429,10 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   if (window.updateStatus) window.updateStatus({ aiSpeak: true });
 
                   // ★ 직전 인터럽트로 audio element / 트랙이 끊어졌다면 여기서 복구.
-                  //   복구하지 않으면 새 AI 응답이 들리지 않음.
-                  const remoteAudio = document.getElementById('remoteAudio');
-                  if (remoteAudio) {
-                      try {
-                          // srcObject 복구 (인터럽트 때 null 로 만들어 두었음)
-                          if (!remoteAudio.srcObject && window.__savedAudioStream) {
-                              remoteAudio.srcObject = window.__savedAudioStream;
-                          }
-                          remoteAudio.muted = false;
-                          remoteAudio.play().catch(() => {});
-                      } catch(_) {}
-                  }
-                  // 수신 audio 트랙 enable (인터럽트 때 disable 했었음)
+                  //   - 수신 audio 트랙을 다시 enable
+                  //   - 기존에 저장해둔 stream 을 그대로 붙이면 jitter buffer 잔재가 흘러나올 수 있어,
+                  //     receiver 들의 현재 track 으로 **새 MediaStream 을 만들어** 붙인다. 이러면
+                  //     audio element 는 깨끗한 시작점에서 라이브 frames 만 들음.
                   try {
                       if (pc && pc.getReceivers) {
                           pc.getReceivers().forEach(r => {
@@ -1444,7 +1443,36 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                       }
                   } catch(_) {}
 
-                  console.log("%c[AI] Speaking started (response.created)", "color: #20c997; font-weight: bold");
+                  const remoteAudio = document.getElementById('remoteAudio');
+                  if (remoteAudio) {
+                      try {
+                          // 받은 audio track 들로 새 MediaStream 생성 (옛 stream 의 버퍼/메모리 끊기)
+                          let freshStream = null;
+                          if (pc && pc.getReceivers) {
+                              const tracks = pc.getReceivers()
+                                  .map(r => r && r.track)
+                                  .filter(t => t && t.kind === 'audio');
+                              if (tracks.length > 0) {
+                                  freshStream = new MediaStream(tracks);
+                              }
+                          }
+                          if (freshStream) {
+                              remoteAudio.srcObject = freshStream;
+                              // 다음 인터럽트 때 복구용으로 저장
+                              window.__savedAudioStream = freshStream;
+                          } else if (!remoteAudio.srcObject && window.__savedAudioStream) {
+                              // 폴백: receiver 가 없는 이상 케이스
+                              remoteAudio.srcObject = window.__savedAudioStream;
+                          }
+                          remoteAudio.muted = false;
+                          remoteAudio.play().catch(() => {});
+                      } catch(streamErr) {
+                          console.warn("[AI] stream restore failed:", streamErr);
+                      }
+                  }
+
+                  console.log("%c[AI] Speaking started (response.created) — fresh stream attached",
+                      "color: #20c997; font-weight: bold");
               }
 
               // === 4.5. AI conversation item id 캡처 (인터럽트 시 truncate 용) ===
@@ -1609,12 +1637,9 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
           if (dc && dc.readyState === 'open') {
               try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
               try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
+
+              // ★ 1) AI 응답 아이템 truncate + delete
               if (currentAiItemId) {
-                  // ★ truncate + delete 둘 다 보냄.
-                  //   - truncate(audio_end_ms=1): 진행 중인 응답의 audio 를 자름 (response 가 살아있으면 효과 있음)
-                  //   - delete: 그 AI 응답 아이템을 컨텍스트에서 통째로 제거 (텍스트까지) → 새 응답이
-                  //             이전 주제를 끌고 오지 못함. 사용자가 'AI가 이전 내용을 계속 말한다'고
-                  //             느낀 핵심 원인은 truncate 가 텍스트는 안 자르기 때문.
                   const truncMs = 1;
                   try {
                       dc.send(JSON.stringify({
@@ -1629,14 +1654,30 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                           type: "conversation.item.delete",
                           item_id: currentAiItemId,
                       }));
-                      console.log(`%c[INTERRUPT] truncate+delete sent for item ${currentAiItemId}`,
+                      console.log(`%c[INTERRUPT] AI item truncate+delete: ${currentAiItemId}`,
                           "color:#ff6b00;font-weight:bold");
                   } catch(_) {}
-                  // 한 번 처리한 id 는 비움. 새 AI 응답 시작 시 response.output_item.added 에서 새 id 로 교체됨.
                   currentAiItemId = null;
               } else {
-                  console.log("%c[INTERRUPT] no currentAiItemId — skipping truncate/delete",
+                  console.log("%c[INTERRUPT] no currentAiItemId",
                       "color:#6c757d;font-style:italic");
+              }
+
+              // ★ 2) 사용자 직전 발화 아이템도 함께 delete
+              //   서버 컨텍스트가 [지움]-[지움]-[새 사용자 발화] 가 되도록 해서, AI 새 응답이
+              //   완전히 새로운 사용자 입력에만 기반하도록 함. 이전 질문이 컨텍스트에 남아있으면
+              //   AI 가 "사용자가 이전에 Czech, Prague Spring 묻고 이제 날씨 묻네"라는 흐름을
+              //   잡아내서 답변이 오염될 수 있음.
+              if (lastUserItemId) {
+                  try {
+                      dc.send(JSON.stringify({
+                          type: "conversation.item.delete",
+                          item_id: lastUserItemId,
+                      }));
+                      console.log(`%c[INTERRUPT] User item delete: ${lastUserItemId}`,
+                          "color:#ff6b00;font-weight:bold");
+                  } catch(_) {}
+                  lastUserItemId = null;
               }
           }
 
