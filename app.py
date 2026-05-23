@@ -986,6 +986,7 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   let missileWaitTimer = null;   // 0.5초 대기 타이머
   let missileFlightTimer = null; // 비행 시간 타이머
   let isMissileActive = false;
+  let userTalkActive = false;   // ★ Push-to-Talk: 사용자가 명시적으로 Talk 버튼을 눌렀는지
   let pendingUserItems = [];     // AI 말 중 수집한 사용자 발화 아이템
   let aiSpeaking = false;        // AI 발화 구간 플래그
   let lastAudioDeltaTs = 0;      // 마지막 response.audio.delta 도착 시각 (ms) - watchdog용
@@ -1048,6 +1049,8 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
           }
 
           console.log(`%c[VAD #${window.debug_vad_count}] 🔇 STOP`, 'color: #ccc; background: #333');
+          // PTT: 한 차례 말이 끝났으니 다음 발화는 다시 Talk 버튼이 필요
+          userTalkActive = false;
           if(window.updateStatus) window.updateStatus({userSpk: false});
 
           if (SETTINGS.is_missile_mode) {
@@ -1177,13 +1180,22 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                       if (speechAccumMs >= TOTAL_MIN_MS || (isMissileActive && avg > CANCEL_BOOST)) {
                           lastSpeechTime = now;
                           if (vadState === "SILENCE") {
-                              const accepted = processVadEvent('input_audio_buffer.speech_started');
-                              if (accepted) {
-                                  vadState = "SPEAKING";
-                                  window.needsBufferClear = false;
-                              } else {
+                              // ★ PTT: 미사일 모드에서 주변 소음 차단.
+                              //   사용자가 'Talk' 버튼을 눌러 userTalkActive 가 true 가 되기 전에는
+                              //   주변 소음/잡담이 mic 임계치를 넘겨도 speech_started 를 발사하지 않는다.
+                              if (!userTalkActive) {
+                                  // 무시 — 버튼 대기
                                   speechActive = false;
                                   speechAccumMs = 0;
+                              } else {
+                                  const accepted = processVadEvent('input_audio_buffer.speech_started');
+                                  if (accepted) {
+                                      vadState = "SPEAKING";
+                                      window.needsBufferClear = false;
+                                  } else {
+                                      speechActive = false;
+                                      speechAccumMs = 0;
+                                  }
                               }
                           }
                       }
@@ -1298,6 +1310,7 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               if (!aiSpeaking && !aiSpeakingWatchdog) return; // 이미 정리됨
               aiSpeaking = false;
               if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
+              if (window.updateStatus) window.updateStatus({ aiSpeak: false });
               console.log(`%c[AI DONE] aiSpeaking=false (reason: ${reason})`, "color: #20c997; font-weight: bold");
 
               if (dc && dc.readyState === 'open') {
@@ -1382,6 +1395,7 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   aiSpeaking = true;
                   lastAudioDeltaTs = Date.now();
                   armAiWatchdog();
+                  if (window.updateStatus) window.updateStatus({ aiSpeak: true });
                   console.log("%c[AI] Speaking started (response.created)", "color: #20c997; font-weight: bold");
               }
 
@@ -1509,6 +1523,62 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
       }
   };
 
+  // ★ Push-to-Talk: 사용자가 명시적으로 발화를 시작.
+  //   - 미사일 모드: 주변 소음이 mic 임계치를 넘어도 무시되다가, 이 버튼이 눌리면 speech_started 가 발사됨.
+  //   - AI 발화 중 호출되면 response.cancel 로 AI 응답을 즉시 끊고, 사용자 발화 모드로 전환.
+  //   - 발화 끝은 기존 미사일 모드의 자동 침묵 감지(또는 일반 모드의 server VAD)가 담당.
+  window.startTalk = () => {
+      try {
+          // 1) AI 발화 중이면 가로채서 종료
+          if (aiSpeaking) {
+              console.log("%c[INTERRUPT] User pressed Talk while AI speaking — canceling AI response",
+                  "background:#ff6b00;color:white;font-weight:bold");
+              if (dc && dc.readyState === 'open') {
+                  try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
+              }
+              // 진행 중인 AI 음성 출력 일시 음소거 (새 응답 시작 시 자연스럽게 풀림)
+              const remoteAudio = document.getElementById('remoteAudio');
+              if (remoteAudio) {
+                  try { remoteAudio.muted = true; } catch(_) {}
+              }
+              // 미사일 타이머/플래그 청소 (혹시 진행 중이었다면)
+              if (missileWaitTimer)   { clearTimeout(missileWaitTimer);   missileWaitTimer = null; }
+              if (missileFlightTimer) { clearTimeout(missileFlightTimer); missileFlightTimer = null; }
+              isMissileActive = false;
+              if (window.updateStatus) window.updateStatus({ firing: false, hit: false });
+              // aiSpeaking 강제 해제 (실제 response.cancelled 이벤트도 곧 도착함)
+              aiSpeaking = false;
+              if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
+              if (window.updateStatus) window.updateStatus({ aiSpeak: false });
+          } else {
+              // 음소거 풀기 (이전에 일시정지/인터럽트로 mute 였을 수 있음)
+              const remoteAudio = document.getElementById('remoteAudio');
+              if (remoteAudio) {
+                  try { remoteAudio.muted = false; } catch(_) {}
+              }
+          }
+
+          // 2) 마이크 보장: enabled = true
+          if (micStream) {
+              try { micStream.getAudioTracks().forEach(t => t.enabled = true); } catch(_) {}
+          }
+
+          // 3) PTT 게이트 열기
+          userTalkActive = true;
+
+          // 4) 미사일 모드면 speech_started 를 직접 발사 (게이트가 닫혀있던 시각화 루프 대신)
+          //    일반 모드는 OpenAI 서버 VAD 가 알아서 감지하므로 별도 발사 불필요.
+          if (SETTINGS.is_missile_mode) {
+              processVadEvent('input_audio_buffer.speech_started');
+          }
+
+          if (window.updateStatus) window.updateStatus({ userSpk: true });
+          console.log("%c[TALK] 🎤 User talk started", "color:#28a745;font-weight:bold");
+      } catch (e) {
+          console.error("[TALK] error:", e);
+      }
+  };
+
   // Soft pause: PeerConnection을 끊지 않고 마이크/오디오만 끈다.
   // → Connect 를 다시 누르면 새 토큰 없이 즉시 재개됨 (사이드바 버튼 안 눌러도 됨).
   window.disconnectSystem = () => {
@@ -1555,7 +1625,7 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   const { useState, useEffect, useRef } = React;
 
   const App = () => {
-    const [status, setStatus] = useState({ conn: "IDLE", userSpk: false, firing: false, hit: false, micLevel: 0 });
+    const [status, setStatus] = useState({ conn: "IDLE", userSpk: false, aiSpeak: false, firing: false, hit: false, micLevel: 0 });
     // 대화 기록: [{role: 'user'|'ai', text, ts: Date}]
     const [messages, setMessages] = useState([]);
     const [errState, setErrState] = useState({ visible: false, stage: "", model: "", message: "", detail: "" });
@@ -1696,6 +1766,36 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
             <div className="mic-meter"><div className="mic-bar" style={{width: `${Math.min(100, status.micLevel * 2)}%`}}></div></div>
         </div>
 
+        {/* === 🎤 PUSH-TO-TALK BUTTON ===
+            클릭: 말하기 시작 (또는 AI 발화 중이면 인터럽트). 끝은 자동 감지(미사일). */}
+        <div style={{textAlign:'center', marginBottom:'10px'}}>
+           <button
+              onClick={() => window.startTalk()}
+              disabled={status.conn !== 'CONNECTED'}
+              style={{
+                 fontSize: '18px',
+                 padding: '14px 36px',
+                 backgroundColor: status.userSpk ? '#dc3545' : (status.conn==='CONNECTED' ? '#28a745' : '#adb5bd'),
+                 color: 'white', border: 'none', borderRadius: '40px',
+                 cursor: status.conn === 'CONNECTED' ? 'pointer' : 'not-allowed',
+                 fontWeight: 'bold',
+                 boxShadow: '0 4px 12px rgba(0,0,0,0.18)',
+                 minWidth: '240px',
+              }}
+              title={status.userSpk ? "듣고 있어요. 말을 멈추면 자동으로 AI에게 보냅니다."
+                                    : "클릭 후 말하세요. AI가 말하는 중이면 끊고 차례를 가져옵니다."}
+           >
+              {status.userSpk
+                ? '🎙️ Listening... (멈추면 자동 종료)'
+                : (status.aiSpeak
+                    ? '✋ Interrupt AI & Talk'
+                    : '🎤 Talk to AI')}
+           </button>
+           <div style={{marginTop:'4px', fontSize:'11px', color:'#6c757d'}}>
+              버튼을 누른 후 영어로 말하세요. AI가 말하는 중에 눌러도 됩니다.
+           </div>
+        </div>
+
         <div className="button-container">
            <button onClick={handleConnect}
                    disabled={status.conn==='CONNECTED' || status.conn==='CONNECTING...'}>
@@ -1708,11 +1808,16 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                    disabled={status.conn!=='CONNECTED'}>
              ⏸ Pause
            </button>
+           <button onClick={() => window.hardDisconnectSystem()}
+                   disabled={status.conn==='IDLE'}
+                   style={{backgroundColor:'#dc3545'}}>
+             🛑 End Session
+           </button>
            {/* [LOG DOWNLOAD BUTTON] */}
            <button onClick={() => window.downloadLogs()} style={{backgroundColor:'#6f42c1'}}>📥 Save Logs</button>
         </div>
         <div style={{textAlign:'center', fontSize:'11px', color:'#6c757d', marginBottom:'6px'}}>
-          Pause는 마이크만 끄고 연결은 유지합니다. Resume 누르면 즉시 재개돼요.
+          Pause: 일시 정지 (연결 유지) · End Session: 완전 종료. 새 세션은 사이드바 'Reconnect / Apply Settings'.
         </div>
         
         <div className="log-box">Ready. Missile Mode: {SETTINGS.is_missile_mode ? "ON" : "OFF"}</div>
