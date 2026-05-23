@@ -991,6 +991,8 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   let aiSpeaking = false;        // AI 발화 구간 플래그
   let lastAudioDeltaTs = 0;      // 마지막 response.audio.delta 도착 시각 (ms) - watchdog용
   let aiSpeakingWatchdog = null; // aiSpeaking 안전 해제 타이머
+  // ★ 현재 AI 가 만들고 있는 conversation item id. 인터럽트 시 truncate 로 서버 컨텍스트를 정리.
+  let currentAiItemId = null;
   const AI_SPEAKING_SILENCE_MS = 5000; // 5초간 오디오 델타 없으면 응답 끝난 것으로 간주
   
   // [IMPORTANT] VAD State for Manual Detection
@@ -1049,8 +1051,11 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
           }
 
           console.log(`%c[VAD #${window.debug_vad_count}] 🔇 STOP`, 'color: #ccc; background: #333');
-          // PTT: 한 차례 말이 끝났으니 다음 발화는 다시 Talk 버튼이 필요
-          userTalkActive = false;
+          // ★ PTT 리셋은 여기서 하지 않는다!
+          //   여기서 false 로 만들면 미사일 대기/비행 중에 사용자가 말을 이어가도
+          //   자동 감지가 게이트에 막혀 speech_started 가 안 떠서 DEFENSE 분기가 실행 안 됨 → 미사일 안 멈춤.
+          //   대신 HIT (commit 실행 직후) 시점에서 리셋한다.
+          //   비-미사일 모드는 speech_stopped 에서 즉시 commit → 그때 리셋.
           if(window.updateStatus) window.updateStatus({userSpk: false});
 
           if (SETTINGS.is_missile_mode) {
@@ -1082,7 +1087,12 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                       if (isMissileActive) {
                           console.log("%c[HIT] 💥 Impact! Committing ALL audio & Requesting Response...", "color: #00ff00; background: black; font-weight: bold");
                           if(window.updateStatus) window.updateStatus({ firing: false, hit: true });
-                          
+
+                          // ★ HIT 시점에 PTT 게이트 닫기. 이제부터는 다시 Talk 버튼이 필요.
+                          //   대기/비행 중에는 userTalkActive=true 였기 때문에 사용자가 말을 이어가면
+                          //   자동 감지가 떠서 DEFENSE 가 미사일을 취소할 수 있었다.
+                          userTalkActive = false;
+
                           if(dc && dc.readyState === 'open') {
                               dc.send(JSON.stringify({type: "input_audio_buffer.commit"}));
                               dc.send(JSON.stringify({type: "response.create"}));
@@ -1113,6 +1123,8 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               }, 500);
           } else {
               console.log("%c[SEND] 📤 Audio Commit + Response", "color: green");
+              // 비-미사일 모드: speech_stopped 시점에 바로 commit → 여기서 PTT 게이트 닫기.
+              userTalkActive = false;
               if(dc && dc.readyState === 'open') {
                   dc.send(JSON.stringify({type: "input_audio_buffer.commit"}));
                   dc.send(JSON.stringify({type: "response.create"}));
@@ -1310,6 +1322,7 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
               if (!aiSpeaking && !aiSpeakingWatchdog) return; // 이미 정리됨
               aiSpeaking = false;
               if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
+              currentAiItemId = null;  // 이번 응답이 끝났으니 추적 종료
               if (window.updateStatus) window.updateStatus({ aiSpeak: false });
               console.log(`%c[AI DONE] aiSpeaking=false (reason: ${reason})`, "color: #20c997; font-weight: bold");
 
@@ -1422,6 +1435,12 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   } catch(_) {}
 
                   console.log("%c[AI] Speaking started (response.created)", "color: #20c997; font-weight: bold");
+              }
+
+              // === 4.5. AI conversation item id 캡처 (인터럽트 시 truncate 용) ===
+              if (ev.type === 'response.output_item.added' && ev.item && ev.item.id) {
+                  currentAiItemId = ev.item.id;
+                  console.log(`%c[AI] item_id captured: ${currentAiItemId}`, "color: #6f42c1; font-size: 10px");
               }
 
               // === 5. AI 활동 신호 도착 시 watchdog 갱신 ===
@@ -1571,10 +1590,28 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
           console.log("%c[INTERRUPT] Talk pressed — unconditionally sending cancel/clear and disabling AI audio track",
               "background:#ff6b00;color:white;font-weight:bold");
 
-          // (a) 서버에 응답 취소 + 입력 버퍼 비우기 (항상 전송)
+          // (a) 서버 정리: cancel + clear + truncate (모두 항상 전송, 없으면 서버가 무시)
+          //   ★ truncate 가 핵심: OpenAI 는 audio 를 realtime 보다 빠르게 만들어 한 번에 보낸다.
+          //   response.done 이 떠도 브라우저 디코더에는 수십 초 분량 audio 가 남아있고,
+          //   서버 대화 컨텍스트에도 그 답변이 통째로 기록되어 있다.
+          //   audio_end_ms=0 으로 truncate 하면 서버가 그 답변을 "사용자가 0ms 만 들었음" 으로 간주해
+          //   컨텍스트에서 잘라낸다 → 새 응답이 깨끗하게 새로운 사용자 발화에만 반응함.
           if (dc && dc.readyState === 'open') {
               try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
               try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
+              if (currentAiItemId) {
+                  try {
+                      dc.send(JSON.stringify({
+                          type: "conversation.item.truncate",
+                          item_id: currentAiItemId,
+                          content_index: 0,
+                          audio_end_ms: 0,
+                      }));
+                      console.log(`%c[INTERRUPT] truncate sent for item ${currentAiItemId} (audio_end_ms=0)`,
+                          "color:#ff6b00;font-weight:bold");
+                  } catch(_) {}
+                  currentAiItemId = null;
+              }
           }
 
           // (b) ★ 브라우저 측 디코더 큐의 잔여 오디오까지 즉시 무음으로.
