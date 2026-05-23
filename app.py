@@ -1792,23 +1792,69 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
         </div>
 
         {/* === ERROR BANNER === */}
-        {errState.visible && (
-          <div className="err-banner">
-            <div className="err-title">⚠️ 연결 실패 — AI 음성이 들리지 않는 진짜 원인은 여기에 있습니다</div>
-            <div className="err-meta">
-              stage: <b>{errState.stage}</b> &nbsp;|&nbsp; model: <b>{errState.model || "(none)"}</b>
+        {errState.visible && (() => {
+          // 에러 종류를 분류해서 적절한 안내를 보여준다.
+          const blob = ((errState.message || "") + " " + (errState.detail || "")).toLowerCase();
+          const isQuota   = /insufficient_quota|exceeded.*quota|quota.*exceeded|billing/i.test(blob);
+          const isAuth    = /invalid.*api.*key|incorrect.*api.*key|unauthorized|401|403/i.test(blob);
+          const isModel   = /model.*not.*found|invalid.*model|model.*does.*not.*exist|404/i.test(blob);
+          const isExpired = /expire|token.*invalid|invalid.*token|client_secret/i.test(blob);
+          let hintEl;
+          if (isQuota) {
+              hintEl = (
+                <span>
+                  💳 <b>OpenAI 계정의 크레딧/할당량이 부족</b>합니다.<br />
+                  <a href="https://platform.openai.com/settings/organization/billing" target="_blank" rel="noopener noreferrer"
+                     style={{color:'#0d6efd', textDecoration:'underline'}}>
+                    OpenAI Billing 페이지
+                  </a> 에서 크레딧을 추가하거나 월 한도(Limits)를 확인하세요.<br />
+                  충전 후 5~10분 기다린 뒤 'Reconnect / Apply Settings' 다시 누르세요.
+                </span>
+              );
+          } else if (isAuth) {
+              hintEl = (
+                <span>
+                  🔑 <b>API 키 인증 실패</b>입니다.<br />
+                  Streamlit Cloud → Settings → Secrets 에서 <code>OPENAI_API_KEY</code> 값이 정확한지 확인하세요.<br />
+                  키가 폐기/회전되었다면 OpenAI 에서 새 키를 발급받아 Secrets 를 업데이트하세요.
+                </span>
+              );
+          } else if (isModel) {
+              hintEl = (
+                <span>
+                  🤖 <b>Realtime 모델 ID 가 유효하지 않음</b>.<br />
+                  Streamlit Cloud → Secrets 에 <code>OPENAI_REALTIME_MODEL = "gpt-realtime"</code> 를 추가하거나
+                  현재 사용 가능한 모델 이름으로 바꿔주세요.
+                </span>
+              );
+          } else if (isExpired) {
+              hintEl = (
+                <span>
+                  ⏳ <b>세션 토큰 만료</b> (60초 한도). 사이드바의 'Reconnect / Apply Settings' 를 다시 누르세요.
+                </span>
+              );
+          } else {
+              hintEl = (
+                <span>
+                  연결 실패. 사이드바 'Reconnect / Apply Settings' 를 다시 눌러보고,
+                  계속 실패하면 F12 콘솔의 빨간색 로그를 확인하세요.
+                </span>
+              );
+          }
+          return (
+            <div className="err-banner">
+              <div className="err-title">⚠️ 연결 실패</div>
+              <div className="err-meta">
+                stage: <b>{errState.stage}</b> &nbsp;|&nbsp; model: <b>{errState.model || "(none)"}</b>
+              </div>
+              <div className="err-detail">{errState.message}{errState.detail ? "\n\n" + errState.detail : ""}</div>
+              <div className="err-hint">{hintEl}</div>
+              <div style={{marginTop:'8px'}}>
+                <button onClick={dismissError} style={{backgroundColor:'#6c757d', padding:'6px 14px'}}>Dismiss</button>
+              </div>
             </div>
-            <div className="err-detail">{errState.message}{errState.detail ? "\n\n" + errState.detail : ""}</div>
-            <div className="err-hint">
-              👉 가장 흔한 원인: <b>OpenAI Realtime 모델 ID 만료</b>.<br />
-              해결: <code>English/.env</code> 파일에 <code>OPENAI_REALTIME_MODEL=...</code> 를 추가하고 Reconnect 하세요.<br />
-              자세한 traceback은 <code>run_app.py</code> 를 띄운 터미널에도 그대로 찍혀 있습니다.
-            </div>
-            <div style={{marginTop:'8px'}}>
-              <button onClick={dismissError} style={{backgroundColor:'#6c757d', padding:'6px 14px'}}>Dismiss</button>
-            </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* === UI: MISSILE BOX === */}
         <div className={`missile-box ${SETTINGS.is_missile_mode ? 'active' : ''}`}>
