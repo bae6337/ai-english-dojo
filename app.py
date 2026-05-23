@@ -1416,8 +1416,17 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
                   console.log("%c[AI] Speaking started (response.created)", "color: #20c997; font-weight: bold");
               }
 
-              // === 5. 오디오 델타 도착 시 watchdog 갱신 ===
-              if (ev.type === 'response.audio.delta' || ev.type === 'response.output_audio.delta') {
+              // === 5. AI 활동 신호 도착 시 watchdog 갱신 ===
+              //   GA WebRTC 모드에선 audio.delta 가 안 오고 오디오는 RTP 로 흐른다.
+              //   transcript delta 도 함께 heartbeat 로 인정해야 watchdog 가 오발사하지 않음.
+              //   (이전 버그: WebRTC 모드인데 audio.delta 만 보고 5초 후 'AI 끝났다'로 잘못 판단 →
+              //    이후 인터럽트가 동작 안 함)
+              if (ev.type === 'response.audio.delta'
+                  || ev.type === 'response.output_audio.delta'
+                  || ev.type === 'response.audio_transcript.delta'
+                  || ev.type === 'response.output_audio_transcript.delta'
+                  || ev.type === 'response.text.delta'
+                  || ev.type === 'response.output_text.delta') {
                   lastAudioDeltaTs = Date.now();
               }
 
@@ -1546,72 +1555,76 @@ REALTIME_CLIENT_HTML_TEMPLATE = r"""
   //   - 발화 끝은 기존 미사일 모드의 자동 침묵 감지(또는 일반 모드의 server VAD)가 담당.
   window.startTalk = () => {
       try {
-          // 1) AI 발화 중이면 가로채서 종료
-          if (aiSpeaking) {
-              console.log("%c[INTERRUPT] User pressed Talk while AI speaking — hard cutting AI",
-                  "background:#ff6b00;color:white;font-weight:bold");
+          // ★★★ 핵심: aiSpeaking 플래그를 신뢰하지 않는다.
+          //   - watchdog 오발사로 aiSpeaking=false 가 되었지만 실제로는 OpenAI 서버가 응답을 계속 생성/전송하는 경우가 있음.
+          //   - 이 경우 사용자가 Talk 를 눌렀을 때 인터럽트 분기로 안 가서 response.cancel 이 전송 안 됨 → AI가 끝까지 말함.
+          //   해결: 매번 무조건 인터럽트 신호를 송신한다. 응답이 없으면 서버가 알아서 무시한다.
 
-              // (a) 서버에 응답 취소 요청 — 더 이상 새 오디오/텍스트를 보내지 마라
-              if (dc && dc.readyState === 'open') {
-                  try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
-                  // 동시에 입력 버퍼도 비워서 AI 에코가 새 발화로 잘못 인식되지 않게.
-                  try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
-              }
+          console.log("%c[INTERRUPT] Talk pressed — unconditionally sending cancel/clear and disabling AI audio track",
+              "background:#ff6b00;color:white;font-weight:bold");
 
-              // (b) ★ 브라우저 측 디코더 큐의 잔여 오디오까지 즉시 무음으로.
-              //   remoteAudio.muted 만으로는 디코더에 쌓인 프레임이 계속 흘러나옴.
-              //   WebRTC 수신 트랙 자체를 enabled=false 로 만들면 트랙이 silence 를 출력.
-              //   다음 response.created 이벤트에서 다시 enabled=true 로 복구.
-              try {
-                  if (pc && pc.getReceivers) {
-                      pc.getReceivers().forEach(r => {
-                          if (r && r.track && r.track.kind === 'audio') {
-                              r.track.enabled = false;
-                          }
-                      });
-                  }
-              } catch (rcvErr) {
-                  console.warn("[INTERRUPT] receiver disable failed:", rcvErr);
-              }
+          // (a) 서버에 응답 취소 + 입력 버퍼 비우기 (항상 전송)
+          if (dc && dc.readyState === 'open') {
+              try { dc.send(JSON.stringify({ type: "response.cancel" })); } catch(_) {}
+              try { dc.send(JSON.stringify({ type: "input_audio_buffer.clear" })); } catch(_) {}
+          }
 
-              // (c) 오디오 요소도 같이 음소거 + 재생 위치 끝으로 점프해 잔여 버퍼 버리기
-              const remoteAudio = document.getElementById('remoteAudio');
-              if (remoteAudio) {
-                  try {
-                      remoteAudio.muted = true;
-                      // currentTime 점프는 일부 브라우저에서 무시될 수 있으나, 가능하면 최신으로.
-                      if (Number.isFinite(remoteAudio.duration) && remoteAudio.duration > 0) {
-                          remoteAudio.currentTime = remoteAudio.duration;
+          // (b) ★ 브라우저 측 디코더 큐의 잔여 오디오까지 즉시 무음으로.
+          //   WebRTC 수신 트랙 자체를 enabled=false 로 만들면 트랙이 즉시 silence 를 출력.
+          //   잠깐 끄고(다음 frame), 다시 켠다 — 디코더 버퍼를 끊는 효과.
+          //   다음 response.created 이벤트에서도 다시 enabled=true 복구함.
+          try {
+              if (pc && pc.getReceivers) {
+                  pc.getReceivers().forEach(r => {
+                      if (r && r.track && r.track.kind === 'audio') {
+                          r.track.enabled = false;
                       }
-                  } catch(_) {}
+                  });
               }
+          } catch (rcvErr) {
+              console.warn("[INTERRUPT] receiver disable failed:", rcvErr);
+          }
 
-              // (d) 미사일 타이머/플래그 청소 (혹시 진행 중이었다면)
-              if (missileWaitTimer)   { clearTimeout(missileWaitTimer);   missileWaitTimer = null; }
-              if (missileFlightTimer) { clearTimeout(missileFlightTimer); missileFlightTimer = null; }
-              isMissileActive = false;
-              if (window.updateStatus) window.updateStatus({ firing: false, hit: false });
-
-              // (e) aiSpeaking 강제 해제 (실제 response.cancelled 이벤트도 곧 도착함)
-              aiSpeaking = false;
-              if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
-              if (window.updateStatus) window.updateStatus({ aiSpeak: false });
-          } else {
-              // AI 가 말 중이 아니더라도, 이전 인터럽트로 트랙이 disabled 였을 가능성 → 복구
+          // (c) 오디오 요소도 mute + srcObject 재설정으로 큐 비우기
+          const remoteAudio = document.getElementById('remoteAudio');
+          if (remoteAudio) {
               try {
-                  if (pc && pc.getReceivers) {
-                      pc.getReceivers().forEach(r => {
-                          if (r && r.track && r.track.kind === 'audio') {
-                              r.track.enabled = true;
-                          }
-                      });
+                  remoteAudio.muted = true;
+                  // srcObject 잠시 끊었다가 다시 연결 → 디코더 큐 초기화 효과
+                  const stream = remoteAudio.srcObject;
+                  if (stream) {
+                      remoteAudio.srcObject = null;
+                      // 다음 tick 에서 다시 붙임. response.created 에서 어차피 복구되지만
+                      // 즉시 청취 가능 상태로 만들어 둠.
+                      setTimeout(() => {
+                          try {
+                              remoteAudio.srcObject = stream;
+                              remoteAudio.muted = false;
+                              // 트랙도 같이 다시 enable (사용자가 말 마치면 새 AI 응답이 와야 하니까)
+                              if (pc && pc.getReceivers) {
+                                  pc.getReceivers().forEach(r => {
+                                      if (r && r.track && r.track.kind === 'audio') {
+                                          r.track.enabled = true;
+                                      }
+                                  });
+                              }
+                              remoteAudio.play().catch(() => {});
+                          } catch(_) {}
+                      }, 50);
                   }
               } catch(_) {}
-              const remoteAudio = document.getElementById('remoteAudio');
-              if (remoteAudio) {
-                  try { remoteAudio.muted = false; } catch(_) {}
-              }
           }
+
+          // (d) 미사일 타이머/플래그 청소
+          if (missileWaitTimer)   { clearTimeout(missileWaitTimer);   missileWaitTimer = null; }
+          if (missileFlightTimer) { clearTimeout(missileFlightTimer); missileFlightTimer = null; }
+          isMissileActive = false;
+          if (window.updateStatus) window.updateStatus({ firing: false, hit: false });
+
+          // (e) aiSpeaking 강제 해제 (서버에서 response.cancelled 이벤트도 곧 도착함)
+          aiSpeaking = false;
+          if (aiSpeakingWatchdog) { clearTimeout(aiSpeakingWatchdog); aiSpeakingWatchdog = null; }
+          if (window.updateStatus) window.updateStatus({ aiSpeak: false });
 
           // 2) 마이크 보장: enabled = true
           if (micStream) {
